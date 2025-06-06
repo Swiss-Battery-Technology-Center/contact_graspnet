@@ -1,197 +1,164 @@
 import numpy as np
-import mayavi.mlab as mlab
+import open3d as o3d
 import matplotlib.pyplot as plt
-from matplotlib import cm
+from scipy.spatial.transform import Rotation as R
 
-import mesh_utils
+# --- ADJUST THESE CONSTANTS FOR VISUAL APPEARANCE ---
+GRIPPER_VISUAL_FORWARD_SHIFT = 0.06  # meters (6cm forward) - KEEPING THIS AGGRESSIVE
 
-def plot_mesh(mesh, cam_trafo=np.eye(4), mesh_pose=np.eye(4)):
-    """
-    Plots mesh in mesh_pose from 
+# Length of the main "finger" part extending forward
+GRIPPER_FINGER_LENGTH_VIS = 0.08  # meters
 
-    Arguments:
-        mesh {trimesh.base.Trimesh} -- input mesh, e.g. gripper
+# Length of the "approach tail" extending backward
+GRIPPER_APPROACH_TAIL_LENGTH_VIS = 0.08 # meters
 
-    Keyword Arguments:
-        cam_trafo {np.ndarray} -- 4x4 transformation from world to camera coords (default: {np.eye(4)})
-        mesh_pose {np.ndarray} -- 4x4 transformation from mesh to world coords (default: {np.eye(4)})
-    """
-    
-    homog_mesh_vert = np.pad(mesh.vertices, (0, 1), 'constant', constant_values=(0, 1))
-    mesh_cam = homog_mesh_vert.dot(mesh_pose.T).dot(cam_trafo.T)[:,:3]
-    mlab.triangular_mesh(mesh_cam[:, 0],
-                         mesh_cam[:, 1],
-                         mesh_cam[:, 2],
-                         mesh.faces,
-                         colormap='Blues',
-                         opacity=0.5)
+GRIPPER_LINE_RADIUS = 0.003  # Slightly thicker lines
+GRIPPER_JOINT_RADIUS = 0.0045 # Slightly larger joints
 
-def plot_coordinates(t,r, tube_radius=0.005):
-    """
-    plots coordinate frame
+# Color for the "finger base" lines (representing width)
+FINGER_BASE_LINE_COLOR = [1.0, 0.6, 0.0] # Orange
+# --- END ADJUSTABLE CONSTANTS ---
 
-    Arguments:
-        t {np.ndarray} -- translation vector
-        r {np.ndarray} -- rotation matrix
 
-    Keyword Arguments:
-        tube_radius {float} -- radius of the plotted tubes (default: {0.005})
-    """
-    mlab.plot3d([t[0],t[0]+0.2*r[0,0]], [t[1],t[1]+0.2*r[1,0]], [t[2],t[2]+0.2*r[2,0]], color=(1,0,0), tube_radius=tube_radius, opacity=1)
-    mlab.plot3d([t[0],t[0]+0.2*r[0,1]], [t[1],t[1]+0.2*r[1,1]], [t[2],t[2]+0.2*r[2,1]], color=(0,1,0), tube_radius=tube_radius, opacity=1)
-    mlab.plot3d([t[0],t[0]+0.2*r[0,2]], [t[1],t[1]+0.2*r[1,2]], [t[2],t[2]+0.2*r[2,2]], color=(0,0,1), tube_radius=tube_radius, opacity=1)
-                
-def show_image(rgb, segmap):
-    """
-    Overlay rgb image with segmentation and imshow segment
+# Helper function to create a cylinder mesh (same as before)
+def create_cylinder_segment(p1, p2, radius, color):
+    p1 = np.asarray(p1); p2 = np.asarray(p2)
+    vector = p2 - p1; length = np.linalg.norm(vector)
+    if length < 1e-5: return None
+    cylinder = o3d.geometry.TriangleMesh.create_cylinder(radius=radius, height=length, resolution=8, split=1)
+    cylinder.paint_uniform_color(color)
+    z_axis_target = vector / length
+    x_axis_temp = np.array([1.0,0,0]) if np.abs(np.dot(z_axis_target,np.array([1.,0,0])))<0.95 else np.array([0,1.,0])
+    y_axis_target = np.cross(z_axis_target, x_axis_temp); y_axis_target /= np.linalg.norm(y_axis_target)
+    x_axis_target = np.cross(y_axis_target, z_axis_target); x_axis_target /= np.linalg.norm(x_axis_target)
+    rotation_matrix = np.eye(3); rotation_matrix[:,0]=x_axis_target; rotation_matrix[:,1]=y_axis_target; rotation_matrix[:,2]=z_axis_target
+    cylinder.rotate(rotation_matrix, center=(0,0,0)); cylinder.translate(p1, relative=False)
+    return cylinder
 
-    Arguments:
-        rgb {np.ndarray} -- color image
-        segmap {np.ndarray} -- integer segmap of same size as rgb
-    """
-    plt.figure()
-    figManager = plt.get_current_fig_manager()
-    figManager.window.showMaximized()
-    
-    plt.ion()
-    plt.show()
-    
-    if rgb is not None:
-        plt.imshow(rgb)
-    if segmap is not None:
-        cmap = plt.get_cmap('rainbow')
-        cmap.set_under(alpha=0.0)   
-        plt.imshow(segmap, cmap=cmap, alpha=0.5, vmin=0.0001)
-    plt.draw()
-    plt.pause(0.001)
-
-def visualize_grasps(full_pc, pred_grasps_cam, scores, plot_opencv_cam=False, pc_colors=None, gripper_openings=None, gripper_width=0.08):
-    """Visualizes colored point cloud and predicted grasps. If given, colors grasps by segmap regions. 
-    Thick grasp is most confident per segment. For scene point cloud predictions, colors grasps according to confidence.
-
-    Arguments:
-        full_pc {np.ndarray} -- Nx3 point cloud of the scene
-        pred_grasps_cam {dict[int:np.ndarray]} -- Predicted 4x4 grasp trafos per segment or for whole point cloud
-        scores {dict[int:np.ndarray]} -- Confidence scores for grasps
-
-    Keyword Arguments:
-        plot_opencv_cam {bool} -- plot camera coordinate frame (default: {False})
-        pc_colors {np.ndarray} -- Nx3 point cloud colors (default: {None})
-        gripper_openings {dict[int:np.ndarray]} -- Predicted grasp widths (default: {None})
-        gripper_width {float} -- If gripper_openings is None, plot grasp widths (default: {0.008})
-    """
-
-    print('Visualizing...takes time')
-    cm = plt.get_cmap('rainbow')
-    cm2 = plt.get_cmap('gist_rainbow')
-   
-    fig = mlab.figure('Pred Grasps')
-    mlab.view(azimuth=180, elevation=180, distance=0.2)
-    draw_pc_with_colors(full_pc, pc_colors)
-    colors = [cm(1. * i/len(pred_grasps_cam))[:3] for i in range(len(pred_grasps_cam))]
-    colors2 = {k:cm2(0.5*np.max(scores[k]))[:3] for k in pred_grasps_cam if np.any(pred_grasps_cam[k])}
-    
-    if plot_opencv_cam:
-        plot_coordinates(np.zeros(3,),np.eye(3,3))
-    for i,k in enumerate(pred_grasps_cam):
-        if np.any(pred_grasps_cam[k]):
-            gripper_openings_k = np.ones(len(pred_grasps_cam[k]))*gripper_width if gripper_openings is None else gripper_openings[k]
-            if len(pred_grasps_cam) > 1:
-                draw_grasps(pred_grasps_cam[k], np.eye(4), color=colors[i], gripper_openings=gripper_openings_k)    
-                draw_grasps([pred_grasps_cam[k][np.argmax(scores[k])]], np.eye(4), color=colors2[k], 
-                            gripper_openings=[gripper_openings_k[np.argmax(scores[k])]], tube_radius=0.0025)    
-            else:
-                colors3 = [cm2(0.5*score)[:3] for score in scores[k]]
-                draw_grasps(pred_grasps_cam[k], np.eye(4), colors=colors3, gripper_openings=gripper_openings_k)    
-    mlab.show()
-
-def draw_pc_with_colors(pc, pc_colors=None, single_color=(0.3,0.3,0.3), mode='2dsquare', scale_factor=0.0018):
-    """
-    Draws colored point clouds
-
-    Arguments:
-        pc {np.ndarray} -- Nx3 point cloud
-        pc_colors {np.ndarray} -- Nx3 point cloud colors
-
-    Keyword Arguments:
-        single_color {tuple} -- single color for point cloud (default: {(0.3,0.3,0.3)})
-        mode {str} -- primitive type to plot (default: {'point'})
-        scale_factor {float} -- Scale of primitives. Does not work for points. (default: {0.002})
-
-    """
-
-    if pc_colors is None:
-        mlab.points3d(pc[:, 0], pc[:, 1], pc[:, 2], color=single_color, scale_factor=scale_factor, mode=mode)
+# ────────────────────────────────────────────────────────────────
+# 3-D grasp visualisation (Open3D) – "Pitchfork" Style
+# ────────────────────────────────────────────────────────────────
+def visualize_grasps_o3d(
+    full_pc, pred_grasps_cam, scores, plot_opencv_cam=False, pc_colors=None,
+    gripper_openings=None, gripper_width=0.08, save_path=None
+):
+    print("Preparing Open3D visualisation…")
+    vis_geometries = []
+    pcd = o3d.geometry.PointCloud(); pcd.points = o3d.utility.Vector3dVector(full_pc)
+    if pc_colors is not None:
+        col = pc_colors.astype(np.float64);
+        if col.max()>1.0: col/=255.0
+        pcd.colors=o3d.utility.Vector3dVector(col)
+    vis_geometries.append(pcd)
+    cmap_obj=plt.get_cmap('tab10'); cmap_scores=plt.get_cmap('viridis')
+    grasps_flat,scores_flat,openings_flat,colors_for_grasps_flat = [],[],[],[]
+    # ... (Flattening logic - kept concise, assuming it's correct from before) ...
+    if isinstance(pred_grasps_cam, dict):
+        obj_idx = 0
+        for obj_id, obj_grasps_list in pred_grasps_cam.items():
+            if obj_grasps_list is None or len(obj_grasps_list) == 0: continue
+            num_g = len(obj_grasps_list); base_c = cmap_obj(obj_idx % cmap_obj.N)[:3]
+            s_list = scores.get(obj_id, [0.5]*num_g); o_list = gripper_openings.get(obj_id, [gripper_width]*num_g) if gripper_openings else [gripper_width]*num_g
+            if len(s_list)!=num_g: s_list=[0.5]*num_g
+            if len(o_list)!=num_g: o_list=[gripper_width]*num_g
+            grasps_flat.extend(obj_grasps_list); scores_flat.extend(s_list); openings_flat.extend(o_list)
+            colors_for_grasps_flat.extend([base_c]*num_g); obj_idx+=1
     else:
-        #create direct grid as 256**3 x 4 array 
-        def create_8bit_rgb_lut():
-            xl = np.mgrid[0:256, 0:256, 0:256]
-            lut = np.vstack((xl[0].reshape(1, 256**3),
-                                xl[1].reshape(1, 256**3),
-                                xl[2].reshape(1, 256**3),
-                                255 * np.ones((1, 256**3)))).T
-            return lut.astype('int32')
-        
-        scalars = pc_colors[:,0]*256**2 + pc_colors[:,1]*256 + pc_colors[:,2]
-        rgb_lut = create_8bit_rgb_lut()
-        points_mlab = mlab.points3d(pc[:, 0], pc[:, 1], pc[:, 2], scalars, mode=mode, scale_factor=.0018)
-        points_mlab.glyph.scale_mode = 'scale_by_vector'
-        points_mlab.module_manager.scalar_lut_manager.lut._vtk_obj.SetTableRange(0, rgb_lut.shape[0])
-        points_mlab.module_manager.scalar_lut_manager.lut.number_of_colors = rgb_lut.shape[0]
-        points_mlab.module_manager.scalar_lut_manager.lut.table = rgb_lut
+        if pred_grasps_cam is None or len(pred_grasps_cam) == 0: print("Warning: pred_grasps_cam (non-dict) is None or empty.")
+        else:
+            num_g = len(pred_grasps_cam); grasps_flat = list(pred_grasps_cam)
+            s_flat = list(scores) if scores is not None and len(scores)==num_g else [0.5]*num_g
+            o_flat = list(gripper_openings) if gripper_openings is not None and len(gripper_openings)==num_g else [gripper_width]*num_g
+            scores_flat = s_flat; openings_flat = o_flat
+            for s_val in scores_flat: colors_for_grasps_flat.append(cmap_scores(np.clip(float(s_val),0,1))[:3])
 
-def draw_grasps(grasps, cam_pose, gripper_openings, color=(0,1.,0), colors=None, show_gripper_mesh=False, tube_radius=0.0008):
-    """
-    Draws wireframe grasps from given camera pose and with given gripper openings
-
-    Arguments:
-        grasps {np.ndarray} -- Nx4x4 grasp pose transformations
-        cam_pose {np.ndarray} -- 4x4 camera pose transformation
-        gripper_openings {np.ndarray} -- Nx1 gripper openings
-
-    Keyword Arguments:
-        color {tuple} -- color of all grasps (default: {(0,1.,0)})
-        colors {np.ndarray} -- Nx3 color of each grasp (default: {None})
-        tube_radius {float} -- Radius of the grasp wireframes (default: {0.0008})
-        show_gripper_mesh {bool} -- Renders the gripper mesh for one of the grasp poses (default: {False})
-    """
-
-    gripper = mesh_utils.create_gripper('panda')
-    gripper_control_points = gripper.get_control_point_tensor(1, False, convex_hull=False).squeeze()
-    mid_point = 0.5*(gripper_control_points[1, :] + gripper_control_points[2, :])
-    grasp_line_plot = np.array([np.zeros((3,)), mid_point, gripper_control_points[1], gripper_control_points[3], 
-                                gripper_control_points[1], gripper_control_points[2], gripper_control_points[4]])
-
-    if show_gripper_mesh and len(grasps) > 0:
-        plot_mesh(gripper.hand, cam_pose, grasps[0])
-        
-    all_pts = []
-    connections = []
-    index = 0
-    N = 7
-    for i,(g,g_opening) in enumerate(zip(grasps, gripper_openings)):
-        gripper_control_points_closed = grasp_line_plot.copy()
-        gripper_control_points_closed[2:,0] = np.sign(grasp_line_plot[2:,0]) * g_opening/2
-        
-        pts = np.matmul(gripper_control_points_closed, g[:3, :3].T)
-        pts += np.expand_dims(g[:3, 3], 0)
-        pts_homog = np.concatenate((pts, np.ones((7, 1))),axis=1)
-        pts = np.dot(pts_homog, cam_pose.T)[:,:3]
-        
-        color = color if colors is None else colors[i]
-        
-        all_pts.append(pts)
-        connections.append(np.vstack([np.arange(index,   index + N - 1.5),
-                                      np.arange(index + 1, index + N - .5)]).T)
-        index += N
-        # mlab.plot3d(pts[:, 0], pts[:, 1], pts[:, 2], color=color, tube_radius=tube_radius, opacity=1.0)
+    MAX_GRASPS_TO_DRAW = 75 # Can increase if performance allows
+    num_grasps_to_draw_actual = min(len(grasps_flat), MAX_GRASPS_TO_DRAW)
     
-    # speeds up plot3d because only one vtk object
-    all_pts = np.vstack(all_pts)
-    connections = np.vstack(connections)
-    src = mlab.pipeline.scalar_scatter(all_pts[:,0], all_pts[:,1], all_pts[:,2])
-    src.mlab_source.dataset.lines = connections
-    src.update()
-    lines =mlab.pipeline.tube(src, tube_radius=tube_radius, tube_sides=12)
-    mlab.pipeline.surface(lines, color=color, opacity=1.0)
+    skipped_due_to_width_count = 0
+
+    for i in range(num_grasps_to_draw_actual):
+        g_matrix = grasps_flat[i]
+        current_width = openings_flat[i]
+        current_grasp_color = colors_for_grasps_flat[i] # Main color for approach/finger length
+
+        if not isinstance(g_matrix, np.ndarray) or g_matrix.shape != (4, 4): continue
+        
+        # Uncomment to debug widths:
+        # print(f"Grasp {i}: width = {current_width:.4f}") 
+
+        # If width is extremely small, the "base" lines will be points.
+        # We can still draw the approach and the two main finger lines from the center.
+        # Let's set a minimum visual width for the base lines if current_width is too small,
+        # but still use current_width for point definition.
+        # If current_width is truly < 1mm, skip to avoid issues.
+        if current_width < 0.0005: # 0.5mm threshold
+            skipped_due_to_width_count +=1
+            continue
+
+        # P0: Visual Palm Center (where approach ends, and finger bases start)
+        p0_palm_center_local = np.array([0, 0, GRIPPER_VISUAL_FORWARD_SHIFT, 1])
+        # P1: Visual Approach Tail
+        p1_approach_tail_local = np.array([0, 0, GRIPPER_VISUAL_FORWARD_SHIFT - GRIPPER_APPROACH_TAIL_LENGTH_VIS, 1])
+
+        # P2: End of Finger 1 Base Line (extends along +X from P0)
+        p2_f1_base_end_local = np.array([current_width / 2, 0, GRIPPER_VISUAL_FORWARD_SHIFT, 1])
+        # P3: Tip of Finger 1 Length Line (extends along +Z from P2)
+        p3_f1_tip_local = np.array([current_width / 2, 0, GRIPPER_VISUAL_FORWARD_SHIFT + GRIPPER_FINGER_LENGTH_VIS, 1])
+
+        # P4: End of Finger 2 Base Line (extends along -X from P0)
+        p4_f2_base_end_local = np.array([-current_width / 2, 0, GRIPPER_VISUAL_FORWARD_SHIFT, 1])
+        # P5: Tip of Finger 2 Length Line (extends along +Z from P4)
+        p5_f2_tip_local = np.array([-current_width / 2, 0, GRIPPER_VISUAL_FORWARD_SHIFT + GRIPPER_FINGER_LENGTH_VIS, 1])
+
+        # Transform all points to camera frame
+        points_local = [p0_palm_center_local, p1_approach_tail_local, 
+                        p2_f1_base_end_local, p3_f1_tip_local,
+                        p4_f2_base_end_local, p5_f2_tip_local]
+        
+        points_cam = [(g_matrix @ p_loc)[:3] for p_loc in points_local]
+        
+        p0_palm_cam, p1_app_tail_cam, p2_f1_base_cam, p3_f1_tip_cam, p4_f2_base_cam, p5_f2_tip_cam = points_cam
+
+        # Create Segments
+        # 1. Approach Line
+        cyl_approach = create_cylinder_segment(p1_app_tail_cam, p0_palm_cam, GRIPPER_LINE_RADIUS, current_grasp_color)
+        if cyl_approach: vis_geometries.append(cyl_approach)
+
+        # 2. Finger 1 Base Line
+        cyl_f1_base = create_cylinder_segment(p0_palm_cam, p2_f1_base_cam, GRIPPER_LINE_RADIUS, FINGER_BASE_LINE_COLOR)
+        if cyl_f1_base: vis_geometries.append(cyl_f1_base)
+        
+        # 3. Finger 1 Length Line
+        cyl_f1_len = create_cylinder_segment(p2_f1_base_cam, p3_f1_tip_cam, GRIPPER_LINE_RADIUS, current_grasp_color)
+        if cyl_f1_len: vis_geometries.append(cyl_f1_len)
+
+        # 4. Finger 2 Base Line
+        cyl_f2_base = create_cylinder_segment(p0_palm_cam, p4_f2_base_cam, GRIPPER_LINE_RADIUS, FINGER_BASE_LINE_COLOR)
+        if cyl_f2_base: vis_geometries.append(cyl_f2_base)
+
+        # 5. Finger 2 Length Line
+        cyl_f2_len = create_cylinder_segment(p4_f2_base_cam, p5_f2_tip_cam, GRIPPER_LINE_RADIUS, current_grasp_color)
+        if cyl_f2_len: vis_geometries.append(cyl_f2_len)
+
+        # Joint Spheres
+        joint_points_for_spheres = [p0_palm_cam, p2_f1_base_cam, p4_f2_base_cam]
+        for jp_cam in joint_points_for_spheres:
+            if np.any(np.isnan(jp_cam)): continue
+            sphere = o3d.geometry.TriangleMesh.create_sphere(radius=GRIPPER_JOINT_RADIUS)
+            sphere.translate(jp_cam); sphere.paint_uniform_color(current_grasp_color) # Use main color for joints
+            vis_geometries.append(sphere)
     
+    if skipped_due_to_width_count > 0:
+        print(f"INFO: Skipped {skipped_due_to_width_count} grasps due to very small opening width (<0.0005m).")
+
+    if plot_opencv_cam: vis_geometries.append(o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.1))
+    view_params = {"window_name":"GraspNet Grasps (Open3D)", "width":1280, "height":720, "front":[0,-0.2,-1], "up":[0,-1,0], "zoom":0.7}
+    if pcd.has_points(): view_params["lookat"]=pcd.get_center()
+    else: view_params["lookat"]=[0,0,0]
+    if save_path:
+        vis=o3d.visualization.Visualizer(); vis.create_window(visible=False, width=view_params["width"], height=view_params["height"])
+        for geom in vis_geometries: vis.add_geometry(geom)
+        ctr=vis.get_view_control(); ctr.set_lookat(view_params["lookat"]); ctr.set_front(view_params["front"]); ctr.set_up(view_params["up"]); ctr.set_zoom(view_params["zoom"])
+        vis.poll_events(); vis.update_renderer(); vis.capture_screen_image(save_path,do_render=True); vis.destroy_window(); print(f"Screenshot saved → {save_path}")
+    else: o3d.visualization.draw_geometries(vis_geometries, **view_params)
